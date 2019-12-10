@@ -149,16 +149,19 @@ TIME_RATIO = Event("Time ratio", 0.0, add, lambda x: '(' + percentage(x) + ')')
 TOTAL_TIME = Event("Total time", 0.0, fail)
 TOTAL_TIME_RATIO = Event("Total time ratio", 0.0, fail, percentage)
 
-labels = {
-    'self-time': TIME,
-    'self-time-percentage': TIME_RATIO,
-    'total-time': TOTAL_TIME,
-    'total-time-percentage': TOTAL_TIME_RATIO,
-}
-defaultLabelNames = ['total-time-percentage', 'self-time-percentage']
-
 totalMethod = 'callratios'
 
+
+def shorten(line):
+    if line is None:
+        return None
+
+    if len(line) > 4096:
+        new_line = line[:4000] + str(hash(line))
+        if line[-1] == '"':
+            new_line += '"'
+        return new_line
+    return line
 
 class Object(object):
     """Base class for all objects in profile which can store events."""
@@ -229,6 +232,7 @@ class Function(Object):
         self.calls[call.callee_id] = call
 
     def get_call(self, callee_id):
+        callee_id = callee_id
         if not callee_id in self.calls:
             call = Call(callee_id)
             call[SAMPLES] = 0
@@ -689,7 +693,7 @@ class Profile(Object):
                     call[outevent] = ratio(call[inevent], self[inevent])
         self[outevent] = 1.0
 
-    def prune(self, node_thres, edge_thres, paths, color_nodes_by_selftime):
+    def prune(self, node_thres, edge_thres, paths, colour_nodes_by_selftime):
         """Prune the profile"""
 
         # compute the prune ratios
@@ -722,19 +726,17 @@ class Profile(Object):
         # prune file paths
         for function_id in compat_keys(self.functions):
             function = self.functions[function_id]
-            if paths and function.filename and not any(function.filename.startswith(path) for path in paths):
-                del self.functions[function_id]
-            elif paths and function.module and not any((function.module.find(path)>-1) for path in paths):
+            if paths and not any(function.filename.startswith(path) for path in paths):
                 del self.functions[function_id]
 
-        # prune the edges
+        # prune the egdes
         for function in compat_itervalues(self.functions):
             for callee_id in compat_keys(function.calls):
                 call = function.calls[callee_id]
                 if callee_id not in self.functions or call.weight is not None and call.weight < edge_thres:
                     del function.calls[callee_id]
 
-        if color_nodes_by_selftime:
+        if colour_nodes_by_selftime:
             weights = []
             for function in compat_itervalues(self.functions):
                 try:
@@ -858,7 +860,6 @@ class JsonParser(Parser):
             except KeyError:
                 pass
             function[SAMPLES] = 0
-            function.called = 0
             profile.add_function(function)
 
         for event in obj['events']:
@@ -867,10 +868,6 @@ class JsonParser(Parser):
             for functionIndex in event['callchain']:
                 function = profile.functions[functionIndex]
                 callchain.append(function)
-
-            # increment the call count of the first in the callchain
-            function = profile.functions[event['callchain'][0]]
-            function.called = function.called + 1
 
             cost = event['cost'][0]
 
@@ -2755,151 +2752,6 @@ class PstatsParser:
 
         return self.profile
 
-class DtraceParser(LineParser):
-    """Parser for linux perf callgraph output.
-
-    It expects output generated with
-        
-        # Refer to https://github.com/brendangregg/FlameGraph#dtrace
-        # 60 seconds of user-level stacks, including time spent in-kernel, for PID 12345 at 97 Hertz     
-        sudo dtrace -x ustackframes=100 -n 'profile-97 /pid == 12345/ { @[ustack()] = count(); } tick-60s { exit(0); }' -o out.user_stacks
-        
-        # The dtrace output
-        gprof2dot.py -f dtrace out.user_stacks
-
-        # Notice: sometimes, the dtrace outputs format may be latin-1, and gprof2dot will fail to parse it.
-        # To solve this problem, you should use iconv to convert to UTF-8 explicitly.
-        # TODO: add an encoding flag to tell gprof2dot how to decode the profile file.
-        iconv -f ISO-8859-1 -t UTF-8 out.user_stacks | gprof2dot.py -f dtrace
-    """
-
-    def __init__(self, infile):
-        LineParser.__init__(self, infile)
-        self.profile = Profile()
-
-    def readline(self):
-        # Override LineParser.readline to ignore comment lines
-        while True:
-            LineParser.readline(self)
-            if self.eof():
-                break
-
-            line = self.lookahead().strip()
-            if line.startswith('CPU'):
-                # The format likes:
-                # CPU     ID                    FUNCTION:NAME
-                #   1  29684                        :tick-60s 
-                # Skip next line
-                LineParser.readline(self)
-            elif not line == '':
-                break
-
-
-    def parse(self):
-        # read lookahead
-        self.readline()
-
-        profile = self.profile
-        profile[SAMPLES] = 0
-        while not self.eof():
-            self.parse_event()
-
-        # compute derived data
-        profile.validate()
-        profile.find_cycles()
-        profile.ratio(TIME_RATIO, SAMPLES)
-        profile.call_ratios(SAMPLES2)
-        if totalMethod == "callratios":
-            # Heuristic approach.  TOTAL_SAMPLES is unused.
-            profile.integrate(TOTAL_TIME_RATIO, TIME_RATIO)
-        elif totalMethod == "callstacks":
-            # Use the actual call chains for functions.
-            profile[TOTAL_SAMPLES] = profile[SAMPLES]
-            profile.ratio(TOTAL_TIME_RATIO, TOTAL_SAMPLES)
-            # Then propagate that total time to the calls.
-            for function in compat_itervalues(profile.functions):
-                for call in compat_itervalues(function.calls):
-                    if call.ratio is not None:
-                        callee = profile.functions[call.callee_id]
-                        call[TOTAL_TIME_RATIO] = call.ratio * callee[TOTAL_TIME_RATIO]
-        else:
-            assert False
-
-        return profile
-
-    def parse_event(self):
-        if self.eof():
-            return
-
-        callchain, count = self.parse_callchain()
-        if not callchain:
-            return
-
-        callee = callchain[0]
-        callee[SAMPLES] += count
-        self.profile[SAMPLES] += count
-
-        for caller in callchain[1:]:
-            try:
-                call = caller.calls[callee.id]
-            except KeyError:
-                call = Call(callee.id)
-                call[SAMPLES2] = count
-                caller.add_call(call)
-            else:
-                call[SAMPLES2] += count
-
-            callee = caller
-
-        # Increment TOTAL_SAMPLES only once on each function.
-        stack = set(callchain)
-        for function in stack:
-            function[TOTAL_SAMPLES] += count
-
-
-    def parse_callchain(self):
-        callchain = []
-        count = 0
-        while self.lookahead():
-            function, count = self.parse_call()
-            if function is None:
-                break
-            callchain.append(function)
-        return callchain, count
-
-    call_re = re.compile(r'^\s+(?P<module>.*)`(?P<symbol>.*)')
-    addr2_re = re.compile(r'\+0x[0-9a-fA-F]+$')
-
-    def parse_call(self):
-        line = self.consume()
-        mo = self.call_re.match(line)
-        if not mo:
-            # The line must be the stack count
-            return None, int(line.strip())
-
-        function_name = mo.group('symbol')
-
-        # If present, amputate program counter from function name.
-        if function_name:
-            function_name = re.sub(self.addr2_re, '', function_name)
-
-        # if not function_name or function_name == '[unknown]':
-        #     function_name = mo.group('address')
-
-        module = mo.group('module')
-
-        function_id = function_name + ':' + module
-
-        try:
-            function = self.profile.functions[function_id]
-        except KeyError:
-            function = Function(function_id, function_name)
-            function.module = os.path.basename(module)
-            function[SAMPLES] = 0
-            function[TOTAL_SAMPLES] = 0
-            self.profile.add_function(function)
-
-        return function, None
 
 formats = {
     "axe": AXEParser,
@@ -2913,7 +2765,6 @@ formats = {
     "sleepy": SleepyParser,
     "sysprof": SysprofParser,
     "xperf": XPerfParser,
-    "dtrace": DtraceParser,
 }
 
 
@@ -3172,6 +3023,7 @@ class DotWriter:
             if len(function_name) >= MAX_FUNCTION_NAME:
                 sys.stderr.write('warning: truncating function name with %u chars (%s)\n' % (len(function_name), function_name[:32] + '...'))
                 function_name = function_name[:MAX_FUNCTION_NAME - 1] + unichr(0x2026)
+                sys.stderr.write("New length: " + str(len(function_name)))
 
             if self.wrap:
                 function_name = self.wrap_function_name(function_name)
@@ -3279,6 +3131,7 @@ class DotWriter:
                 s = id
             else:
                 s = self.escape(id)
+            s = shorten(s)
         else:
             raise TypeError
         self.write(s)
@@ -3321,19 +3174,13 @@ def naturalJoin(values):
         return ''.join(values)
 
 
-def main(argv=sys.argv[1:]):
+def main():
     """Main program."""
 
     global totalMethod
 
     formatNames = list(formats.keys())
     formatNames.sort()
-
-    themeNames = list(themes.keys())
-    themeNames.sort()
-
-    labelNames = list(labels.keys())
-    labelNames.sort()
 
     optparser = optparse.OptionParser(
         usage="\n\t%prog [options] [file] ...")
@@ -3361,24 +3208,19 @@ def main(argv=sys.argv[1:]):
         help="preferred method of calculating total time: callratios or callstacks (currently affects only perf format) [default: %default]")
     optparser.add_option(
         '-c', '--colormap',
-        type="choice", choices=themeNames,
+        type="choice", choices=('color', 'pink', 'gray', 'bw', 'print'),
         dest="theme", default="color",
-        help="color map: %s [default: %%default]" % naturalJoin(themeNames))
+        help="color map: color, pink, gray, bw, or print [default: %default]")
     optparser.add_option(
         '-s', '--strip',
         action="store_true",
         dest="strip", default=False,
         help="strip function parameters, template parameters, and const modifiers from demangled C++ function names")
     optparser.add_option(
-        '--color-nodes-by-selftime',
-        action="store_true",
-        dest="color_nodes_by_selftime", default=False,
-        help="color nodes by self time, rather than by total time (sum of self and descendants)")
-    optparser.add_option(
         '--colour-nodes-by-selftime',
         action="store_true",
-        dest="color_nodes_by_selftime",
-        help=optparse.SUPPRESS_HELP)
+        dest="colour_nodes_by_selftime", default=False,
+        help="colour nodes by self time, rather than by total time (sum of self and descendants)")
     optparser.add_option(
         '-w', '--wrap',
         action="store_true",
@@ -3389,13 +3231,6 @@ def main(argv=sys.argv[1:]):
         action="store_true",
         dest="show_samples", default=False,
         help="show function samples")
-    optparser.add_option(
-        '--node-label', metavar='MEASURE',
-        type='choice', choices=labelNames,
-        action='append',
-        dest='node_labels',
-        help="measurements to on show the node (can be specified multiple times): %s [default: %s]" % (
-            naturalJoin(labelNames), ', '.join(defaultLabelNames)))
     # add option to create subtree or show paths
     optparser.add_option(
         '-z', '--root',
@@ -3422,7 +3257,7 @@ def main(argv=sys.argv[1:]):
         '-p', '--path', action="append",
         type="string", dest="filter_paths",
         help="Filter all modules not in a specified path")
-    (options, args) = optparser.parse_args(argv)
+    (options, args) = optparser.parse_args(sys.argv[1:])
 
     if len(args) > 1 and options.format != 'pstats':
         optparser.error('incorrect number of arguments')
@@ -3476,14 +3311,11 @@ def main(argv=sys.argv[1:]):
     dot = DotWriter(output)
     dot.strip = options.strip
     dot.wrap = options.wrap
-
-    labelNames = options.node_labels or defaultLabelNames
-    dot.show_function_events = [labels[l] for l in labelNames]
     if options.show_samples:
         dot.show_function_events.append(SAMPLES)
 
     profile = profile
-    profile.prune(options.node_thres/100.0, options.edge_thres/100.0, options.filter_paths, options.color_nodes_by_selftime)
+    profile.prune(options.node_thres/100.0, options.edge_thres/100.0, options.filter_paths, options.colour_nodes_by_selftime)
 
     if options.root:
         rootIds = profile.getFunctionIds(options.root)
